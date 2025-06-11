@@ -64,7 +64,7 @@ defaults:
     carla: { size: [128, 128], repeat: 2, use_seed: True }
     maniskill:
       {
-        size: [128, 128],
+        size: [256, 256],
         obs_mode: rgb,
         control_mode: pd_joint_delta_pos,
         sim_backend: physx_cpu,
