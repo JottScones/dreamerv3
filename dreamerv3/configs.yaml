@@ -68,14 +68,16 @@ defaults:
         control_mode: pd_joint_delta_pos,
         sim_backend: physx_cpu,
         use_seed: True,
+        in_distribution: True
       }
     maniskillview:
       {
-        size: [128, 128],
+        size: [256, 256],
         obs_mode: rgb,
         control_mode: pd_joint_delta_pos,
         sim_backend: physx_cpu,
         use_seed: True,
+        in_distribution: True
       }
 
   replay:
@@ -388,7 +390,9 @@ maniskill:
 maniskillview:
   task: maniskillview_PickSingleYCBWristView-v1
   script: eval_only
-  run: { steps: 10000, from_checkpoint: "logdir/baseline_pick_ycb/ckpt/20250611T075717F873023" }
+  run: { steps: 10000, from_checkpoint: "logdir/DINOFreeze_pick_ycb_train/ckpt/20250612T182947F619465" }
+  agent.enc.typ: dino
+  agent.enc.freeze: True
   agent.enc.simple.mults: [2, 3, 4, 4, 4]
   agent.dec.simple.mults: [2, 3, 4, 4, 4]
 
