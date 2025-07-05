@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import perception_models.core.vision_encoder.pe as pe
 from custom_models.dino import CheckpointableFlaxDinov2Model
-from transformers import AutoImageProcessor, FlaxDinov2Model
+from transformers import FlaxCLIPVisionModel
 
 from torch.nn import functional as F
 from PIL import Image
@@ -440,6 +440,99 @@ class PEEncoder(Encoder):
         return x
 
 
+print("Loading CLIP...")
+_CLIP_MODULE = FlaxCLIPVisionModel.from_pretrained(
+    "openai/clip-vit-base-patch32", dtype=jax.numpy.bfloat16)
+CLIP_PARAMS_HOST = jax.tree_util.tree_map(
+    lambda x: np.asarray(x, dtype=x.dtype), _CLIP_MODULE.params)
+
+
+class ClipEncoderModule(nj.Module):
+    def __init__(self, freeze=False):
+        super().__init__()
+        self.freeze = freeze
+
+    """Thin wrapper that registers Dinov2 parameters in the Ninjax tree."""
+
+    def __call__(self, x, *, train: bool):
+        # 1) Retrieve or create the param tree inside Ninjax
+        params = nj.Variable(
+            lambda: CLIP_PARAMS_HOST,
+            name='pretrained_vision_params',
+        ).read()
+
+        # (Batch, Sequence, Hidden Size)
+        out = _CLIP_MODULE(
+            x, train=train, params=params).pooler_output
+        return sg(out) if self.freeze else out
+
+
+CLIP_RESIZE = 224
+CLIP_CROP = 224
+CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+
+
+def clip_preprocess_images(imgs):
+    imgs = imgs.astype(jnp.float32)
+    batch_size, h, w, c = imgs.shape
+
+    # Resize if necessary
+    if h != CLIP_RESIZE:
+        imgs = jax.image.resize(
+            imgs, (batch_size, CLIP_RESIZE, CLIP_RESIZE, c), method="cubic")
+
+    if CLIP_RESIZE != CLIP_CROP:
+        # Central Crop
+        left = top = (CLIP_RESIZE - CLIP_CROP) // 2
+        imgs = jax.lax.dynamic_slice(
+            imgs, (0, top, left, 0), (batch_size, CLIP_CROP, CLIP_CROP, c))
+
+    # Rescale
+    imgs = imgs / 255.0          # rescale
+    imgs = (imgs - CLIP_MEAN) / CLIP_STD  # normalize
+
+    return imgs
+
+
+class CLIPEncoder(Encoder):
+    units: int = 1024
+    norm: str = 'rms'
+    act: str = 'gelu'
+    depth: int = 64
+    mults: tuple = (2, 3, 4, 4)
+    layers: int = 3
+    kernel: int = 5
+    symlog: bool = True
+    outer: bool = False
+    strided: bool = False
+
+    def __init__(self, obs_space, freeze=False, **kw):
+        super().__init__(obs_space, **kw)
+        self.freeze = freeze
+
+    def encode_image_obs(self, obs, bdims, training=False):
+        imgs = [obs[k] for k in sorted(self.imgkeys)]
+        assert all(x.dtype == jnp.uint8 for x in imgs)
+
+        x = nn.cast(jnp.concatenate(imgs, -1), force=True)
+        x = x.reshape((-1, *x.shape[bdims:]))
+        x = clip_preprocess_images(x)
+        x = jax.numpy.permute_dims(x, (0, 3, 1, 2))
+
+        # Forward pass through the image encoder
+        x = self.sub('clip_enc', ClipEncoderModule,
+                     self.freeze)(x, train=training)
+
+        # Apply activation and normalization
+        x = nn.act(self.act)(self.sub(f'dino_norm', nn.Norm, self.norm)(x))
+
+        # Flatten all dimensions except the first (batch dimension)
+        x = x.reshape((x.shape[0], -1))
+
+        return x
+
+
 print("Loading Dinov2...")
 _DINOV2_MODULE = CheckpointableFlaxDinov2Model.from_pretrained(
     "facebook/dinov2-small", dtype=jax.numpy.bfloat16)
@@ -447,7 +540,7 @@ DINO_PARAMS_HOST = jax.tree_util.tree_map(
     lambda x: np.asarray(x, dtype=x.dtype), _DINOV2_MODULE.params)
 
 
-class DinoEncoder(nj.Module):
+class DinoEncoderModule(nj.Module):
     def __init__(self, freeze=False):
         super().__init__()
         self.freeze = freeze
@@ -468,29 +561,30 @@ class DinoEncoder(nj.Module):
         return sg(out) if self.freeze else out
 
 
-RESIZE = 256
-CROP = 224
-MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+DINO_RESIZE = 256
+DINO_CROP = 224
+DINO_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+DINO_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-def preprocess_images(imgs):
+def dino_preprocess_images(imgs):
     imgs = imgs.astype(jnp.float32)
     batch_size, h, w, c = imgs.shape
 
     # Resize if necessary
-    if h != RESIZE:
+    if h != DINO_RESIZE:
         imgs = jax.image.resize(
-            imgs, (batch_size, RESIZE, RESIZE, c), method="cubic")
+            imgs, (batch_size, DINO_RESIZE, DINO_RESIZE, c), method="cubic")
 
-    # Central Crop
-    left = top = (RESIZE - CROP) // 2
-    imgs = jax.lax.dynamic_slice(
-        imgs, (0, top, left, 0), (batch_size, CROP, CROP, c))
+    if DINO_RESIZE != DINO_CROP:
+        # Central Crop
+        left = top = (DINO_RESIZE - DINO_CROP) // 2
+        imgs = jax.lax.dynamic_slice(
+            imgs, (0, top, left, 0), (batch_size, DINO_CROP, DINO_CROP, c))
 
     # Rescale
     imgs = imgs / 255.0          # rescale
-    imgs = (imgs - MEAN) / STD  # normalize
+    imgs = (imgs - DINO_MEAN) / DINO_STD  # normalize
 
     return imgs
 
@@ -521,11 +615,12 @@ class DINOv2Encoder(Encoder):
 
         x = nn.cast(jnp.concatenate(imgs, -1), force=True)
         x = x.reshape((-1, *x.shape[bdims:]))
-        x = preprocess_images(x)
+        x = dino_preprocess_images(x)
         x = jax.numpy.permute_dims(x, (0, 3, 1, 2))
 
         # Forward pass through the image encoder
-        x = self.sub('dino_enc', DinoEncoder, self.freeze)(x, train=training)
+        x = self.sub('dino_enc', DinoEncoderModule,
+                     self.freeze)(x, train=training)
 
         # Apply activation and normalization
         x = nn.act(self.act)(self.sub(f'dino_norm', nn.Norm, self.norm)(x))
